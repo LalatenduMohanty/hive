@@ -61,6 +61,9 @@ exit 0
 
 	alwaysErrorBinary = `#!/bin/sh
 exit 1`
+	fetchLogsScriptTemplate = `#!/bin/bash
+ssh -o "StrictHostKeyChecking=no" -A core@%s '/usr/local/bin/installer-gather.sh'
+scp -o "StrictHostKeyChecking=no" core@%s:~/log-bundle.tar.gz .`
 )
 
 var (

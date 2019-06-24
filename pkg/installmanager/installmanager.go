@@ -61,10 +61,6 @@ const (
 	installerFullLogFile                = ".openshift_install.log"
 	installerConsoleLogFilePath         = "/tmp/openshift-install-console.log"
 	sleepSecondsFilename                = "sleep-seconds.txt"
-
-	fetchLogsScriptTemplate = `#!/bin/bash
-ssh -o "StrictHostKeyChecking=no" -A core@%s '/usr/local/bin/installer-gather.sh'
-scp -o "StrictHostKeyChecking=no" core@%s:~/log-bundle.tar.gz .`
 )
 
 var (
@@ -490,12 +486,12 @@ func (m *InstallManager) runOpenShiftInstallCommand(args []string) error {
 		m.waitForFiles([]string{logfileName})
 
 		logfile, err := os.Open(logfileName)
-		defer logfile.Close()
 		if err != nil {
 			// FIXME what is a better response to being unable to open the file
 			m.log.WithError(err).Fatalf("unable to open installer log file to display to stdout")
 			panic("unable to open log file")
 		}
+		defer logfile.Close()
 
 		r := bufio.NewReader(logfile)
 		fullLine := ""
@@ -620,54 +616,6 @@ func (m *InstallManager) loadClusterDeployment() (*hivev1.ClusterDeployment, err
 		return nil, err
 	}
 	return cd, nil
-}
-
-func gatherLogs(cd *hivev1.ClusterDeployment, m *InstallManager) error {
-	m.log.Info("Gathering logs/tarball")
-
-	m.log.Debug("Checking for SSH private key")
-	sshPrivKeyPath := os.Getenv("SSH_PRIV_KEY_PATH")
-	if sshPrivKeyPath == "" {
-		m.log.Warn("cannot gather logs as SSH_PRIV_KEY_PATH is unset or empty")
-		return nil
-	}
-	fileInfo, err := os.Stat(sshPrivKeyPath)
-	if err != nil && os.IsNotExist(err) {
-		m.log.Warn("cannot gather logs/tarball as no ssh private key file found")
-		return err
-	} else if err != nil {
-		m.log.WithError(err).Error("error stating file containing private key")
-		return err
-	}
-
-	if fileInfo.Size() == 0 {
-		m.log.Warn("cannot gather logs/tarball as ssh private key file is empty")
-		return err
-	}
-
-	// set up ssh private key, and run the log gathering script
-	cleanup, err := initSSHAgent(sshPrivKeyPath, m)
-	defer cleanup()
-	if err != nil {
-		m.log.WithError(err).Error("failed to setup SSH agent")
-		return err
-	}
-
-	bootstrapIP, err := getBootstrapIP(m)
-	if err != nil {
-		return err
-	}
-
-	logTarball, err := runGatherScript(bootstrapIP, fetchLogsScriptTemplate, m)
-	if err != nil {
-		m.log.Error("failed to run script for gathering logs")
-		return err
-	}
-	defer os.Remove(logTarball)
-
-	// TODO: upload/save log file
-
-	return fmt.Errorf("ALWAYS FAIL TO SAVE LOG UNTIL IMPLEMENTED")
 }
 
 func runGatherScript(bootstrapIP, scriptTemplate string, m *InstallManager) (string, error) {
@@ -1152,9 +1100,5 @@ func updateClusterDeploymentStatusWithRetries(m *InstallManager, f clusterDeploy
 }
 
 func cleanupLogOutput(fullLog string) string {
-	var cleanedString string
-
-	cleanedString = multiLineRedactLinesWithPassword.ReplaceAllString(fullLog, "REDACTED LINE OF OUTPUT")
-
-	return cleanedString
+	return multiLineRedactLinesWithPassword.ReplaceAllString(fullLog, "REDACTED LINE OF OUTPUT")
 }
