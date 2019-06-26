@@ -29,7 +29,7 @@ var (
 )
 
 func TestGenerateImageSetJob(t *testing.T) {
-	job := GenerateImageSetJob(testClusterDeployment(), *testImageSet().Spec.ReleaseImage, "test-service-account", testCLIImageSpec, testHiveImageSpec)
+	job, _ := GenerateImageSetJob(testClusterDeployment(), *testImageSet().Spec.ReleaseImage, "test-service-account", testCLIImageSpec, testHiveImageSpec)
 	validateJob(t, job)
 }
 
@@ -37,6 +37,9 @@ func testClusterDeployment() *hivev1.ClusterDeployment {
 	cd := &hivev1.ClusterDeployment{}
 	cd.Name = "test-cluster-deployment"
 	cd.Namespace = "test-namespace"
+	cd.Status.PullSecret = corev1.LocalObjectReference{
+		Name: testPullSecretName,
+	}
 	return cd
 }
 

@@ -73,7 +73,7 @@ func GenerateInstallerJob(
 			Name: "PULL_SECRET",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: cd.Spec.PullSecret,
+					LocalObjectReference: *cd.Spec.PullSecret,
 					Key:                  corev1.DockerConfigJsonKey,
 				},
 			},
@@ -224,7 +224,7 @@ func GenerateInstallerJob(
 		Volumes:            volumes,
 		ServiceAccountName: serviceAccountName,
 		ImagePullSecrets: []corev1.LocalObjectReference{
-			cd.Spec.PullSecret,
+			*cd.Spec.PullSecret,
 		},
 	}
 

@@ -3,6 +3,7 @@ package clusterdeployment
 import (
 	"context"
 	"fmt"
+	"os"
 	"reflect"
 	"regexp"
 	"strconv"
@@ -11,10 +12,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	log "github.com/sirupsen/logrus"
 
+	routev1 "github.com/openshift/api/route/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilrand "k8s.io/apimachinery/pkg/util/rand"
+
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
@@ -27,8 +31,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-
-	routev1 "github.com/openshift/api/route/v1"
 
 	apihelpers "github.com/openshift/hive/pkg/apis/helpers"
 	hivev1 "github.com/openshift/hive/pkg/apis/hive/v1alpha1"
@@ -278,7 +280,7 @@ func (r *ReconcileClusterDeployment) reconcile(request reconcile.Request, cd *hi
 		cdLog.Info("correcting empty cluster version fields")
 		err := r.Status().Update(context.TODO(), cd)
 		if err != nil {
-			cdLog.WithError(err).Error("error updating cluster deployment")
+			cdLog.WithError(err).Error("error updating cluster deployment status")
 			return reconcile.Result{}, err
 		}
 		return reconcile.Result{
@@ -397,6 +399,18 @@ func (r *ReconcileClusterDeployment) reconcile(request reconcile.Request, cd *hi
 		return reconcile.Result{}, err
 	}
 
+	cdLog.Debug("loading pull secrets")
+	pullSecret, err := r.mergePullSecrets(cd, cdLog)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	// Update the pull secret object if required
+	err = r.updatePullSecretInfo(pullSecret, cd, cdLog)
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
 	if cd.Status.InstallerImage == nil {
 		return r.resolveInstallerImage(cd, imageSet, releaseImage, hiveImage, cdLog)
 	}
@@ -459,13 +473,6 @@ func (r *ReconcileClusterDeployment) reconcile(request reconcile.Request, cd *hi
 			cd.Namespace,
 			hivemetrics.GetClusterDeploymentType(cd)).Set(
 			time.Since(cd.CreationTimestamp.Time).Seconds())
-
-		cdLog.Debug("loading pull secret secret")
-		pullSecret, err := controllerutils.LoadSecretData(r.Client, cd.Spec.PullSecret.Name, cd.Namespace, corev1.DockerConfigJsonKey)
-		if err != nil {
-			cdLog.WithError(err).Error("unable to load pull secret from secret")
-			return reconcile.Result{}, err
-		}
 
 		job, err := install.GenerateInstallerJob(
 			cd,
@@ -656,7 +663,12 @@ func (r *ReconcileClusterDeployment) resolveInstallerImage(cd *hivev1.ClusterDep
 		return reconcile.Result{}, r.statusUpdate(cd, cdLog)
 	}
 	cliImage := images.GetCLIImage(cdLog)
-	job := imageset.GenerateImageSetJob(cd, releaseImage, serviceAccountName, imageset.AlwaysPullImage(cliImage), imageset.AlwaysPullImage(hiveImage))
+	job, err := imageset.GenerateImageSetJob(cd, releaseImage, serviceAccountName, imageset.AlwaysPullImage(cliImage), imageset.AlwaysPullImage(hiveImage))
+	if err != nil {
+		errMsg := "Error generating image set job"
+		cdLog.WithError(err).Error(errMsg)
+		return reconcile.Result{}, fmt.Errorf("%s : %v", errMsg, err)
+	}
 	if err := controllerutil.SetControllerReference(cd, job, r.scheme); err != nil {
 		cdLog.WithError(err).Error("error setting controller reference on job")
 		return reconcile.Result{}, err
@@ -666,7 +678,7 @@ func (r *ReconcileClusterDeployment) resolveInstallerImage(cd *hivev1.ClusterDep
 	jobLog := cdLog.WithField("job", jobName)
 
 	existingJob := &batchv1.Job{}
-	err := r.Get(context.TODO(), jobName, existingJob)
+	err = r.Get(context.TODO(), jobName, existingJob)
 	switch {
 	// If the job exists but is in the process of getting deleted, requeue and wait for the delete
 	// to complete.
@@ -1260,6 +1272,23 @@ func generateDeprovisionRequest(cd *hivev1.ClusterDeployment) *hivev1.ClusterDep
 	return req
 }
 
+func generatePullSecretObj(pullSecret string, pullSecretName string, cd *hivev1.ClusterDeployment) *corev1.Secret {
+	return &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "Secret",
+			APIVersion: corev1.SchemeGroupVersion.String(),
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pullSecretName,
+			Namespace: cd.Namespace,
+		},
+		Type: corev1.SecretTypeDockerConfigJson,
+		StringData: map[string]string{
+			corev1.DockerConfigJsonKey: pullSecret,
+		},
+	}
+}
+
 func migrateWildcardIngress(cd *hivev1.ClusterDeployment) bool {
 	migrated := false
 	for i, ingress := range cd.Spec.Ingress {
@@ -1308,4 +1337,90 @@ func initializeAnnotations(cd *hivev1.ClusterDeployment) {
 	if cd.Annotations == nil {
 		cd.Annotations = map[string]string{}
 	}
+}
+
+// mergePullSecrets takes pull secretes in to account and returns the merged pull request
+func (r *ReconcileClusterDeployment) mergePullSecrets(cd *hivev1.ClusterDeployment, cdLog log.FieldLogger) (string, error) {
+
+	// For code readability let's call the pull secret in cluster deployment config as local pull secret
+	localPullSecret, _ := controllerutils.LoadSecretData(r.Client, cd.Spec.PullSecret.Name, cd.Namespace, corev1.DockerConfigJsonKey)
+
+	// Check if global pull secret from env as it comes from hive config
+	globalPullSecret := os.Getenv("GLOBAL_PULL_SECRET")
+
+	switch {
+	case globalPullSecret != "" && localPullSecret != "":
+		// Merge local pullSecret and globalPullSecret. If both pull secrets have same registry name
+		// then the merged pull secret will have registry secret from local pull secret
+		pullSecret, err := controllerutils.MergeJsons(globalPullSecret, localPullSecret, cdLog)
+		if err != nil {
+			errMsg := "unable to merge global pull secret with local pull secret"
+			cdLog.WithError(err).Error(errMsg)
+			return "", fmt.Errorf("%s : %v", errMsg, err)
+		}
+		return pullSecret, nil
+	case globalPullSecret != "":
+		return globalPullSecret, nil
+	case localPullSecret != "":
+		return localPullSecret, nil
+	default:
+		errMsg := "clusterdeployment must specify pull secret since hiveconfig does not specify a global pull secret"
+		cdLog.Error(errMsg)
+		return "", fmt.Errorf("%s", errMsg)
+	}
+}
+
+// updatePullSecretInfo adds pull secret information in cluster deployment and cluster deployment status
+func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd *hivev1.ClusterDeployment, cdLog log.FieldLogger) error {
+	var secretName string
+	var noExistingPullSecretObj bool
+
+	existingPullSecretObj := &corev1.Secret{}
+
+	if cd.Status.PullSecret.Name != "" {
+		secretName = cd.Status.PullSecret.Name
+		err := r.Get(context.TODO(), types.NamespacedName{Name: secretName, Namespace: cd.Namespace}, existingPullSecretObj)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				noExistingPullSecretObj = true
+			} else {
+				cdLog.WithError(err).Error("Error getting pull secret from cluster deployment")
+				return err
+			}
+		}
+	} else {
+		secretName = apihelpers.GetResourceName(cd.Name, "pull-secret-"+utilrand.String(8))
+		noExistingPullSecretObj = true
+	}
+
+	// We need to use the same secretName for generating a new pull secret object as the name should be same
+	pullSecretObj := generatePullSecretObj(pullSecret, secretName, cd)
+
+	if noExistingPullSecretObj {
+		err := r.Create(context.TODO(), pullSecretObj)
+		if err != nil {
+			cdLog.Errorf("error creating pull secret object: %v", err)
+			return err
+		}
+		cdLog.Debug("Created the new pull secret object in cluster deployment successfully")
+
+		// Update pullsecret information in cluster deployment status
+		cd.Status.PullSecret = corev1.LocalObjectReference{Name: secretName}
+		return r.statusUpdate(cd, cdLog)
+	}
+
+	// update the pull secret object if the current one different than the existing one
+	if controllerutils.CalculateHashOfSecret(pullSecretObj) != controllerutils.CalculateHashOfSecret(existingPullSecretObj) {
+		if err := controllerutil.SetControllerReference(cd, pullSecretObj, r.scheme); err != nil {
+			cdLog.WithError(err).Error("error setting controller reference on pullSecretObj")
+			return err
+		}
+		err := r.Update(context.TODO(), pullSecretObj)
+		if err != nil {
+			cdLog.Errorf("error updating pull secret object: %v", err)
+			return err
+		}
+		cdLog.Debug("Updated the new pull secret object in cluster deployment successfully")
+	}
+	return nil
 }

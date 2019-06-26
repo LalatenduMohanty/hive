@@ -208,9 +208,25 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testCompletedInstallJob(),
 				testMetadataConfigMap(),
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
-				testSecret(corev1.SecretTypeDockercfg, pullSecretSecret, corev1.DockerConfigKey, "{}"),
+				testSecret(corev1.SecretTypeDockercfg, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
+		},
+		{
+			name: "clusterdeployment must specify pull secret when there is no global pull secret ",
+			existing: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					cd := testClusterDeployment()
+					cd.Status.Installed = true
+					cd.Status.AdminKubeconfigSecret = corev1.LocalObjectReference{Name: adminKubeconfigSecret}
+					return cd
+				}(),
+				testCompletedInstallJob(),
+				testMetadataConfigMap(),
+				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
+				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
+			},
+			expectErr: true,
 		},
 		{
 			name: "Completed with install job manually deleted",
@@ -853,7 +869,7 @@ func testClusterDeployment() *hivev1.ClusterDeployment {
 		},
 		ControlPlane: hivev1.MachinePool{},
 		Compute:      []hivev1.MachinePool{},
-		PullSecret: corev1.LocalObjectReference{
+		PullSecret: &corev1.LocalObjectReference{
 			Name: pullSecretSecret,
 		},
 		Platform: hivev1.Platform{
@@ -878,6 +894,7 @@ func testClusterDeployment() *hivev1.ClusterDeployment {
 		InfraID:        testInfraID,
 		InstallerImage: strPtr("installer-image:latest"),
 	}
+	cd.Status.PullSecret = corev1.LocalObjectReference{Name: pullSecretSecret}
 
 	controllerutils.FixupEmptyClusterVersionFields(&cd.Status.ClusterVersionStatus)
 	return cd
