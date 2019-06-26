@@ -69,8 +69,8 @@ type ClusterDeploymentSpec struct {
 	Platform `json:"platform"`
 
 	// PullSecret is the reference to the secret to use when pulling images.
-	// +required
-	PullSecret corev1.LocalObjectReference `json:"pullSecret"`
+	// +optional
+	PullSecret *corev1.LocalObjectReference `json:"pullSecret,omitempty"`
 
 	// PlatformSecrets contains credentials and secrets for the cluster infrastructure.
 	// +required
@@ -199,6 +199,9 @@ type ClusterDeploymentStatus struct {
 	// CertificateBundles contains of the status of the certificate bundles associated with this cluster deployment.
 	// +optional
 	CertificateBundles []CertificateBundleStatus `json:"certificateBundles,omitempty"`
+
+	// PullSecret will hold the pull secret information which is used by cluster deployment
+	PullSecret corev1.LocalObjectReference `json:"pullSecret,omitempty"`
 }
 
 // ClusterDeploymentCondition contains details for the current condition of a cluster deployment

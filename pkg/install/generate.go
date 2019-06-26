@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/pkg/errors"
+
 	log "github.com/sirupsen/logrus"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -52,8 +54,7 @@ func GenerateInstallerJob(
 	cd *hivev1.ClusterDeployment,
 	hiveImage, releaseImage string,
 	serviceAccountName string,
-	sshKey string,
-	pullSecret string) (*batchv1.Job, error) {
+	sshKey string) (*batchv1.Job, error) {
 
 	cdLog := log.WithFields(log.Fields{
 		"clusterDeployment": cd.Name,
@@ -61,7 +62,9 @@ func GenerateInstallerJob(
 	})
 
 	cdLog.Debug("generating installer job")
-
+	if cd.Status.PullSecret.Name == "" {
+		return nil, errors.New("Pull secret information not found in cluster deploymment status")
+	}
 	tryOnce := false
 	if cd.Annotations != nil {
 		value, exists := cd.Annotations[tryInstallOnceAnnotation]
@@ -73,7 +76,7 @@ func GenerateInstallerJob(
 			Name: "PULL_SECRET",
 			ValueFrom: &corev1.EnvVarSource{
 				SecretKeyRef: &corev1.SecretKeySelector{
-					LocalObjectReference: cd.Spec.PullSecret,
+					LocalObjectReference: cd.Status.PullSecret,
 					Key:                  corev1.DockerConfigJsonKey,
 				},
 			},
@@ -223,9 +226,7 @@ func GenerateInstallerJob(
 		Containers:         containers,
 		Volumes:            volumes,
 		ServiceAccountName: serviceAccountName,
-		ImagePullSecrets: []corev1.LocalObjectReference{
-			cd.Spec.PullSecret,
-		},
+		ImagePullSecrets:   []corev1.LocalObjectReference{cd.Status.PullSecret},
 	}
 
 	completions := int32(1)

@@ -3,6 +3,8 @@ package imageset
 import (
 	"time"
 
+	"github.com/pkg/errors"
+
 	log "github.com/sirupsen/logrus"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -42,8 +44,10 @@ fi
 
 // GenerateImageSetJob creates a job to determine the installer image for a ClusterImageSet
 // given a release image
-func GenerateImageSetJob(cd *hivev1.ClusterDeployment, releaseImage, serviceAccountName string, cli, hive ImageSpec) *batchv1.Job {
-
+func GenerateImageSetJob(cd *hivev1.ClusterDeployment, releaseImage, serviceAccountName string, cli, hive ImageSpec) (*batchv1.Job, error) {
+	if cd.Status.PullSecret.Name == "" {
+		return nil, errors.New("Pull secret information not found in cluster deploymment status")
+	}
 	logger := log.WithFields(log.Fields{
 		"clusterdeployment": types.NamespacedName{Namespace: cd.Namespace, Name: cd.Name}.String(),
 	})
@@ -72,7 +76,7 @@ func GenerateImageSetJob(cd *hivev1.ClusterDeployment, releaseImage, serviceAcco
 			Name: "pullsecret",
 			VolumeSource: corev1.VolumeSource{
 				Secret: &corev1.SecretVolumeSource{
-					SecretName: cd.Spec.PullSecret.Name,
+					SecretName: cd.Status.PullSecret.Name,
 				},
 			},
 		},
@@ -164,7 +168,7 @@ func GenerateImageSetJob(cd *hivev1.ClusterDeployment, releaseImage, serviceAcco
 		},
 	}
 
-	return job
+	return job, nil
 }
 
 // GetImageSetJobName returns the expected name of the imageset job for a ClusterImageSet.

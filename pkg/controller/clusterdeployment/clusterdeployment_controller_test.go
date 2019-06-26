@@ -3,6 +3,7 @@ package clusterdeployment
 import (
 	"context"
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
@@ -208,9 +209,25 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 				testCompletedInstallJob(),
 				testMetadataConfigMap(),
 				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
-				testSecret(corev1.SecretTypeDockercfg, pullSecretSecret, corev1.DockerConfigKey, "{}"),
+				testSecret(corev1.SecretTypeDockercfg, pullSecretSecret, corev1.DockerConfigJsonKey, "{}"),
 				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
 			},
+		},
+		{
+			name: "clusterdeployment must specify pull secret when there is no global pull secret ",
+			existing: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					cd := testClusterDeployment()
+					cd.Status.Installed = true
+					cd.Status.AdminKubeconfigSecret = corev1.LocalObjectReference{Name: adminKubeconfigSecret}
+					return cd
+				}(),
+				testCompletedInstallJob(),
+				testMetadataConfigMap(),
+				testSecret(corev1.SecretTypeOpaque, adminKubeconfigSecret, "kubeconfig", adminKubeconfig),
+				testSecret(corev1.SecretTypeOpaque, sshKeySecret, adminSSHKeySecretKey, "fakesshkey"),
+			},
+			expectErr: true,
 		},
 		{
 			name: "Completed with install job manually deleted",
@@ -245,8 +262,7 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 						"example.com/fake:latest",
 						"",
 						"fakeserviceaccount",
-						"sshkey",
-						"pullsecret")
+						"sshkey")
 					return job
 				}(),
 			},
@@ -302,8 +318,7 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 						"example.com/fake:latest",
 						"",
 						"fakeserviceaccount",
-						"sshkey",
-						"pullsecret")
+						"sshkey")
 					return job
 				}(),
 			},
@@ -329,8 +344,7 @@ func TestClusterDeploymentReconcile(t *testing.T) {
 						"fakeserviceaccount",
 						"",
 						"fakeserviceaccount",
-						"sshkey",
-						"pullsecret")
+						"sshkey")
 					wrongGeneration := "-1"
 					job.Annotations[clusterDeploymentGenerationAnnotation] = wrongGeneration
 					return job
@@ -853,7 +867,7 @@ func testClusterDeployment() *hivev1.ClusterDeployment {
 		},
 		ControlPlane: hivev1.MachinePool{},
 		Compute:      []hivev1.MachinePool{},
-		PullSecret: corev1.LocalObjectReference{
+		PullSecret: &corev1.LocalObjectReference{
 			Name: pullSecretSecret,
 		},
 		Platform: hivev1.Platform{
@@ -878,6 +892,7 @@ func testClusterDeployment() *hivev1.ClusterDeployment {
 		InfraID:        testInfraID,
 		InstallerImage: strPtr("installer-image:latest"),
 	}
+	cd.Status.PullSecret = corev1.LocalObjectReference{Name: pullSecretSecret}
 
 	controllerutils.FixupEmptyClusterVersionFields(&cd.Status.ClusterVersionStatus)
 	return cd
@@ -916,7 +931,7 @@ func testInstallJob() *batchv1.Job {
 	job, err := install.GenerateInstallerJob(cd,
 		images.DefaultHiveImage,
 		"",
-		serviceAccountName, "testSSHKey", "testPullSecret")
+		serviceAccountName, "testSSHKey")
 	if err != nil {
 		panic("should not error while generating test install job")
 	}
@@ -1194,4 +1209,238 @@ func getJob(c client.Client, name string) *batchv1.Job {
 
 func getInstallJob(c client.Client) *batchv1.Job {
 	return getJob(c, installJobName)
+}
+
+func TestUpdatePullSecretInfo(t *testing.T) {
+	testPullSecret1 := `{"auths": {"registry.svc.ci.okd.org": {"auth": "dXNljlfjldsfSDD"}}}`
+
+	tests := []struct {
+		name       string
+		pullSecret string
+		existingCD []runtime.Object
+		validate   func(*testing.T, *hivev1.ClusterDeployment)
+	}{
+		{
+			name:       "updates cd status with new pull secret name",
+			pullSecret: testPullSecret1,
+			existingCD: []runtime.Object{
+				getCDWithoutPullSecret(),
+			},
+			validate: func(t *testing.T, cd *hivev1.ClusterDeployment) {
+				if cd.Status.PullSecret.Name == "" {
+					t.Errorf("Did not find pull secret name in cluster deployment status")
+				}
+			},
+		},
+		{
+			name:       "changes cd status with new pull secret name",
+			pullSecret: testPullSecret1,
+			existingCD: []runtime.Object{
+				testClusterDeployment(),
+			},
+			validate: func(t *testing.T, cd *hivev1.ClusterDeployment) {
+				oldCD := testClusterDeployment()
+				if cd.Status.PullSecret.Name == oldCD.Status.PullSecret.Name {
+					t.Errorf("Pull secret name in status should have changed")
+				}
+			},
+		},
+		{
+			name:       "Pull secret name in cd status should not change",
+			pullSecret: testPullSecret1,
+			existingCD: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					cd := getCDWithoutPullSecret()
+					cd.Spec.PullSecret = &corev1.LocalObjectReference{
+						Name: pullSecretSecret,
+					}
+					cd.Status.PullSecret.Name = pullSecretSecret
+					return cd
+				}(),
+				testSecret(corev1.SecretTypeDockercfg, pullSecretSecret, corev1.DockerConfigJsonKey, testPullSecret1),
+			},
+			validate: func(t *testing.T, cd *hivev1.ClusterDeployment) {
+				if cd.Status.PullSecret.Name != pullSecretSecret {
+					t.Errorf("Pull secret name in status should not have changed")
+				}
+			},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fakeClient := fake.NewFakeClient(test.existingCD...)
+			rcd := &ReconcileClusterDeployment{
+				Client:                        fakeClient,
+				scheme:                        scheme.Scheme,
+				logger:                        log.WithField("controller", "clusterDeployment"),
+				remoteClusterAPIClientBuilder: testRemoteClusterAPIClientBuilder,
+			}
+			cd := getCDFromClient(fakeClient)
+			err := rcd.updatePullSecretInfo(test.pullSecret, cd, rcd.logger)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			cd = getCDFromClient(rcd.Client)
+			if test.validate != nil {
+				test.validate(t, cd)
+			}
+		})
+	}
+}
+
+func getCDWithoutPullSecret() *hivev1.ClusterDeployment {
+	cd := testEmptyClusterDeployment()
+
+	cd.Spec = hivev1.ClusterDeploymentSpec{
+		ClusterName: testClusterName,
+		SSHKey: &corev1.LocalObjectReference{
+			Name: sshKeySecret,
+		},
+		ControlPlane: hivev1.MachinePool{},
+		Compute:      []hivev1.MachinePool{},
+		Platform: hivev1.Platform{
+			AWS: &hivev1.AWSPlatform{
+				Region: "us-east-1",
+			},
+		},
+		Networking: hivev1.Networking{
+			Type: hivev1.NetworkTypeOpenshiftSDN,
+		},
+		PlatformSecrets: hivev1.PlatformSecrets{
+			AWS: &hivev1.AWSPlatformSecrets{
+				Credentials: corev1.LocalObjectReference{
+					Name: "aws-credentials",
+				},
+			},
+		},
+	}
+	cd.Status = hivev1.ClusterDeploymentStatus{
+		ClusterID:      testClusterID,
+		InfraID:        testInfraID,
+		InstallerImage: strPtr("installer-image:latest"),
+	}
+	cd.Status.AdminKubeconfigSecret = corev1.LocalObjectReference{Name: adminKubeconfigSecret}
+
+	controllerutils.FixupEmptyClusterVersionFields(&cd.Status.ClusterVersionStatus)
+	return cd
+}
+
+func getCDFromClient(c client.Client) *hivev1.ClusterDeployment {
+	cd := &hivev1.ClusterDeployment{}
+	err := c.Get(context.TODO(), client.ObjectKey{Name: testName, Namespace: testNamespace}, cd)
+	if err == nil {
+		return cd
+	}
+	return nil
+}
+
+func TestMergePullSecrets(t *testing.T) {
+
+	tests := []struct {
+		name             string
+		localPullSecret  string
+		globalPullSecret string
+		mergedPullSecret string
+		existingCD       []runtime.Object
+		expectedErr      bool
+		expectedMismatch bool
+	}{
+		{
+			name:             "merged pull secret should be be equal to local secret",
+			localPullSecret:  `{"auths": {"registry.svc.ci.okd.org": {"auth": "dXNljlfjldsfSDD"}}}`,
+			mergedPullSecret: `{"auths": {"registry.svc.ci.okd.org": {"auth": "dXNljlfjldsfSDD"}}}`,
+			existingCD: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					cd := getCDWithoutPullSecret()
+					cd.Spec.PullSecret = &corev1.LocalObjectReference{
+						Name: pullSecretSecret,
+					}
+					return cd
+				}(),
+			},
+		},
+		{
+			name:             "Test should fail as merged pull secret is not equal to local secret",
+			localPullSecret:  `{"auths": {"registry.svc.ci.okd.org": {"auth": "dXNljlfjldsfSDD"}}}`,
+			mergedPullSecret: `{"auths": {"registry.svc.ci.okd.org": {"auth": "aaaaaaaaaaaaaaa"}}}`,
+			existingCD: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					cd := getCDWithoutPullSecret()
+					cd.Spec.PullSecret = &corev1.LocalObjectReference{
+						Name: pullSecretSecret,
+					}
+					return cd
+				}(),
+			},
+			expectedMismatch: true,
+		},
+		{
+			name:             "merged pull secret should be be equal to global pull secret",
+			globalPullSecret: `{"auths": {"registry.svc.ci.okd.org": {"auth": "dXNljlfjldsfSDD"}}}`,
+			mergedPullSecret: `{"auths": {"registry.svc.ci.okd.org": {"auth": "dXNljlfjldsfSDD"}}}`,
+			existingCD: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					return getCDWithoutPullSecret()
+				}(),
+			},
+		},
+		{
+			name:             "Both local secret and global pull secret available",
+			localPullSecret:  `{"auths": {"registry.svc.ci.okd.org": {"auth": "dXNljlfjldsfSDD"}}}`,
+			globalPullSecret: `{"auths":{"cloud.okd.com":{"auth":"b34xVjWERckjfUyV1pMQTc=","email":"abc@xyz.com"}}}`,
+			mergedPullSecret: `{"auths":{"cloud.okd.com":{"auth":"b34xVjWERckjfUyV1pMQTc=","email":"abc@xyz.com"},"registry.svc.ci.okd.org":{"auth":"dXNljlfjldsfSDD"}}}`,
+			existingCD: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					cd := getCDWithoutPullSecret()
+					cd.Spec.PullSecret = &corev1.LocalObjectReference{
+						Name: pullSecretSecret,
+					}
+					return cd
+				}(),
+			},
+		},
+		{
+			name: "Test should fail as local an global pull secret is not available",
+			existingCD: []runtime.Object{
+				func() *hivev1.ClusterDeployment {
+					return getCDWithoutPullSecret()
+				}(),
+			},
+			expectedErr: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fakeClient := fake.NewFakeClient(test.existingCD...)
+			rcd := &ReconcileClusterDeployment{
+				Client:                        fakeClient,
+				scheme:                        scheme.Scheme,
+				logger:                        log.WithField("controller", "clusterDeployment"),
+				remoteClusterAPIClientBuilder: testRemoteClusterAPIClientBuilder,
+			}
+
+			localSecretObject := testSecret(corev1.SecretTypeDockercfg, pullSecretSecret, corev1.DockerConfigJsonKey, test.localPullSecret)
+			err := rcd.Create(context.TODO(), localSecretObject)
+			if err != nil {
+				t.Errorf("unexpected error: %v", err)
+				return
+			}
+			cd := getCDFromClient(rcd.Client)
+			if test.globalPullSecret != "" {
+				os.Setenv("GLOBAL_PULL_SECRET", test.globalPullSecret)
+			}
+			defer os.Unsetenv("GLOBAL_PULL_SECRET")
+			expetedPullSecret, err := rcd.mergePullSecrets(cd, rcd.logger)
+			if test.expectedErr {
+				assert.Error(t, err)
+			} else if test.expectedMismatch {
+				assert.NotEqual(t, test.mergedPullSecret, expetedPullSecret)
+			} else {
+				assert.Equal(t, test.mergedPullSecret, expetedPullSecret)
+			}
+		})
+	}
 }
