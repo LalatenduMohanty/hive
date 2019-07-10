@@ -402,12 +402,14 @@ func (r *ReconcileClusterDeployment) reconcile(request reconcile.Request, cd *hi
 	cdLog.Debug("loading pull secrets")
 	pullSecret, err := r.mergePullSecrets(cd, cdLog)
 	if err != nil {
+		cdLog.WithError(err).Error("Error merging pull secretss")
 		return reconcile.Result{}, err
 	}
 
 	// Update the pull secret object if required
 	err = r.updatePullSecretInfo(pullSecret, cd, cdLog)
 	if err != nil {
+		cdLog.WithError(err).Error("Error updating the merged pull secret")
 		return reconcile.Result{}, err
 	}
 
@@ -1373,54 +1375,77 @@ func (r *ReconcileClusterDeployment) mergePullSecrets(cd *hivev1.ClusterDeployme
 // updatePullSecretInfo adds pull secret information in cluster deployment and cluster deployment status
 func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd *hivev1.ClusterDeployment, cdLog log.FieldLogger) error {
 	var secretName string
-	var noExistingPullSecretObj bool
+	var isHashDifferent bool
 
+	// Get existing pull secret
+	isPullSecretObjExists := true
 	existingPullSecretObj := &corev1.Secret{}
-
 	if cd.Status.PullSecret.Name != "" {
 		secretName = cd.Status.PullSecret.Name
 		err := r.Get(context.TODO(), types.NamespacedName{Name: secretName, Namespace: cd.Namespace}, existingPullSecretObj)
 		if err != nil {
 			if errors.IsNotFound(err) {
-				noExistingPullSecretObj = true
+				isPullSecretObjExists = false
 			} else {
-				cdLog.WithError(err).Error("Error getting pull secret from cluster deployment")
-				return err
+				return fmt.Errorf(fmt.Sprintf("Error getting pull secret from cluster deployment : %v", err))
 			}
 		}
-	} else {
-		secretName = apihelpers.GetResourceName(cd.Name, "pull-secret-"+utilrand.String(8))
-		noExistingPullSecretObj = true
 	}
 
-	// We need to use the same secretName for generating a new pull secret object as the name should be same
-	pullSecretObj := generatePullSecretObj(pullSecret, secretName, cd)
-
-	if noExistingPullSecretObj {
-		err := r.Create(context.TODO(), pullSecretObj)
+	if isPullSecretObjExists {
+		existingPullSecret, ok := existingPullSecretObj.Data[corev1.DockerConfigJsonKey]
+		if !ok {
+			return fmt.Errorf("Pull secret %s did not contain key %s", secretName, corev1.DockerConfigJsonKey)
+		}
+		hashOfexistingSecret, err := controllerutils.GetHash(existingPullSecret)
 		if err != nil {
-			cdLog.Errorf("error creating pull secret object: %v", err)
-			return err
+			return fmt.Errorf(fmt.Sprintf("Error creating checksum of %s : %v", secretName, err))
 		}
-		cdLog.Debug("Created the new pull secret object in cluster deployment successfully")
-
-		// Update pullsecret information in cluster deployment status
-		cd.Status.PullSecret = corev1.LocalObjectReference{Name: secretName}
-		return r.statusUpdate(cd, cdLog)
-	}
-
-	// update the pull secret object if the current one different than the existing one
-	if controllerutils.CalculateHashOfSecret(pullSecretObj) != controllerutils.CalculateHashOfSecret(existingPullSecretObj) {
-		if err := controllerutil.SetControllerReference(cd, pullSecretObj, r.scheme); err != nil {
-			cdLog.WithError(err).Error("error setting controller reference on pullSecretObj")
-			return err
-		}
-		err := r.Update(context.TODO(), pullSecretObj)
+		hashOfNewSecret, err := controllerutils.GetHash([]byte(pullSecret))
 		if err != nil {
-			cdLog.Errorf("error updating pull secret object: %v", err)
-			return err
+			return fmt.Errorf(fmt.Sprintf("Error creating checksum of new pull secret : %v", err))
 		}
-		cdLog.Debug("Updated the new pull secret object in cluster deployment successfully")
+
+		// Check if the pull secrets checksums  are  different
+		if hashOfexistingSecret != hashOfNewSecret {
+			isHashDifferent = true
+		}
 	}
+
+	if !isHashDifferent {
+		cdLog.Debug("No new pull secret found")
+		return nil
+	}
+
+	// delete the existing pull secret object
+	err := r.Delete(context.TODO(), existingPullSecretObj, client.PropagationPolicy(metav1.DeletePropagationBackground))
+	if err != nil {
+		return fmt.Errorf(fmt.Sprintf("Error deleting the old existing pull secret %s: %v", secretName, err))
+	}
+
+	// create a new pull secret object and update the cluster deployment status
+	newSecretName := apihelpers.GetResourceName(cd.Name, "pull-secret-"+utilrand.String(8))
+	newPullSecretObj := generatePullSecretObj(pullSecret, newSecretName, cd)
+	err = r.Create(context.TODO(), newPullSecretObj)
+	if err != nil {
+		return fmt.Errorf(fmt.Sprintf("error creating new pull secret object: %v", err))
+	}
+	cdLog.Debug("Created the new pull secret object in cluster deployment successfully")
+
+	// Update new pullsecret information in cluster deployment status
+	cd.Status.PullSecret = corev1.LocalObjectReference{Name: newSecretName}
+	err = r.statusUpdate(cd, cdLog)
+	defer func(err error) {
+		if err != nil {
+			err := r.Delete(context.TODO(), newPullSecretObj, client.PropagationPolicy(metav1.DeletePropagationBackground))
+			if err != nil {
+				cdLog.WithError(err).Errorf("Error deleting the new pull secret %s", newSecretName)
+			}
+		}
+	}(err)
+	if err != nil {
+		return fmt.Errorf(fmt.Sprintf("error updating the cluster deployment status with new pull secret : %v", err))
+	}
+	cdLog.Debug("Updated the cluster deployment status with the new pull secret object successfully")
 	return nil
 }

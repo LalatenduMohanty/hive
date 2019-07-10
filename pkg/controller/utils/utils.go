@@ -1,7 +1,9 @@
 package utils
 
 import (
+	"crypto/md5"
 	"encoding/json"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -179,4 +181,13 @@ func MergeJsons(globalPullSecret string, localPullSecret string, cdLog log.Field
 		return "", err
 	}
 	return string(jMerged), nil
+}
+
+// GetHash returns md5 sum of a string
+func GetHash(data interface{}) (string, error) {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", md5.Sum(b)), nil
 }
