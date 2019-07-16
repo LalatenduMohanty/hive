@@ -1277,7 +1277,7 @@ func TestUpdatePullSecretInfo(t *testing.T) {
 				remoteClusterAPIClientBuilder: testRemoteClusterAPIClientBuilder,
 			}
 			cd := getCDFromClient(fakeClient)
-			err := rcd.updatePullSecretInfo(test.pullSecret, cd, rcd.logger)
+			_, err := rcd.updatePullSecretInfo(test.pullSecret, cd, rcd.logger)
 			if err != nil {
 				t.Errorf("unexpected error: %v", err)
 				return

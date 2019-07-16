@@ -409,9 +409,12 @@ func (r *ReconcileClusterDeployment) reconcile(request reconcile.Request, cd *hi
 	}
 
 	// Update the pull secret object if required
-	err = r.updatePullSecretInfo(pullSecret, cd, cdLog)
+	ok, err = r.updatePullSecretInfo(pullSecret, cd, cdLog)
 	if err != nil {
 		cdLog.WithError(err).Error("Error updating the merged pull secret")
+	}
+	if ok {
+		cdLog.Info("Reconciling for new merged pull secret")
 		return reconcile.Result{}, err
 	}
 
@@ -1383,8 +1386,8 @@ func (r *ReconcileClusterDeployment) mergePullSecrets(cd *hivev1.ClusterDeployme
 	}
 }
 
-// updatePullSecretInfo adds pull secret information in cluster deployment and cluster deployment status
-func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd *hivev1.ClusterDeployment, cdLog log.FieldLogger) error {
+// updatePullSecretInfo adds pull secret information in cluster deployment and cluster deployment status.
+func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd *hivev1.ClusterDeployment, cdLog log.FieldLogger) (bool, error) {
 	var existingSecretName string
 	var err error
 
@@ -1401,7 +1404,7 @@ func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd 
 			if apierrors.IsNotFound(err) {
 				pullSecretObjExists = false
 			} else {
-				return errors.Wrap(err, "Error getting pull secret from cluster deployment")
+				return true, errors.Wrap(err, "Error getting pull secret from cluster deployment")
 			}
 		}
 	}
@@ -1409,11 +1412,11 @@ func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd 
 	if pullSecretObjExists {
 		existingPullSecret, ok := existingPullSecretObj.Data[corev1.DockerConfigJsonKey]
 		if !ok {
-			return errors.New(fmt.Sprintf("Pull secret %s did not contain key %s", existingSecretName, corev1.DockerConfigJsonKey))
+			return true, errors.New(fmt.Sprintf("Pull secret %s did not contain key %s", existingSecretName, corev1.DockerConfigJsonKey))
 		}
 		if controllerutils.GetHashOfPullSecret(string(existingPullSecret)) == controllerutils.GetHashOfPullSecret(pullSecret) {
 			cdLog.Debug("No new merged pull secret found")
-			return nil
+			return false, nil
 		}
 		cdLog.Info("Existing merged pull secret hash did not match with latest merged pull secret")
 	}
@@ -1427,15 +1430,15 @@ func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd 
 	err = controllerutil.SetControllerReference(cd, newPullSecretObj, r.scheme)
 	if err != nil {
 		cdLog.Errorf("error setting controller reference on new merged pull secret: %v", err)
-		return err
+		return true, err
 	}
 	err = r.Create(context.TODO(), newPullSecretObj)
 	if err != nil {
-		return errors.Wrap(err, "error creating new pull secret object")
+		return true, errors.Wrap(err, "error creating new pull secret object")
 	}
 	defer func() {
 		if err != nil {
-			if err := r.Delete(context.TODO(), newPullSecretObj); err != nil {
+			if err := r.Delete(context.TODO(), newPullSecretObj, client.PropagationPolicy(metav1.DeletePropagationBackground)); err != nil {
 				cdLog.WithError(err).Error("Error deleting the new pull secret")
 			}
 		}
@@ -1444,16 +1447,16 @@ func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd 
 	//Get the new pull secret name
 	newSecretName := newPullSecretObj.Name
 	if newSecretName == "" {
-		return errors.New("Generated name is empty for merged pull secret")
+		return true, errors.New("Generated name is empty for merged pull secret")
 	}
 
 	cdLog.WithField("secretName", newSecretName).Info("Created new merged pull secret for cluster deployment")
 
 	// delete the existing pull secret object
 	if pullSecretObjExists {
-		err := r.Delete(context.TODO(), existingPullSecretObj)
+		err := r.Delete(context.TODO(), existingPullSecretObj, client.PropagationPolicy(metav1.DeletePropagationBackground))
 		if err != nil {
-			return errors.Wrapf(err, "Error deleting the old existing pull secret %s", existingSecretName)
+			return true, errors.Wrapf(err, "Error deleting the old existing pull secret %s", existingSecretName)
 		}
 	}
 
@@ -1461,9 +1464,9 @@ func (r *ReconcileClusterDeployment) updatePullSecretInfo(pullSecret string, cd 
 	cd.Status.PullSecret = corev1.LocalObjectReference{Name: newSecretName}
 	err = r.statusUpdate(cd, cdLog)
 	if err != nil {
-		return errors.Wrap(err, "error updating the cluster deployment status with new pull secret")
+		return true, errors.Wrap(err, "error updating the cluster deployment status with new pull secret")
 	}
 
 	cdLog.WithField("secretName", newSecretName).Info("Updated the cluster deployment status with the new pull secret object successfully")
-	return nil
+	return true, nil
 }
